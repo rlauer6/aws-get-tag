@@ -1,0 +1,144 @@
+#!/bin/bash
+# -*- mode: sh; -*-
+
+function get_region() {
+    
+    if [ -z "$AWS_REGION" ]; then
+	EC2_AVAIL_ZONE=$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)
+	if [ -n "$EC2_AVAIL_ZONE" ]; then
+	    AWS_REGION=$(echo $EC2_AVAIL_ZONE | sed -r 's/([0-9]+)[a-z]+$/\1/')
+	fi
+    fi
+    
+    if [ -z "$AWS_REGION" ]; then
+	AWS_REGION="$AWS_DEFAULT_REGION"
+    fi
+}
+
+function get_instance_id {
+    # container?
+    if [ -z "$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI" ]; then
+        EC2_INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+    fi
+}
+
+function usage() {
+    if [ -n "$1" ]; then
+	echo "ERROR: $1 - try usage: $0 -h"
+	exit 1
+    fi
+
+    cat <<EOF
+usage: $0 OPTIONS tag-name
+
+Example: aws-get-tag Environment
+
+ ENVIRONMENT=\$(aws-get-tag -e Environment)
+
+ eval \$(aws-get-tag -e Environment)
+
+Options
+-------
+-r    region
+-i    instance id, default: currently running instance
+-e    shell mode (outputs 'export TAG-NAME=value')
+-n    retries, default: 1
+-t    timeout (sleep in seconds between retries), default: 2
+EOF
+}
+
+get_region
+get_instance_id
+
+OPTS=$(getopt -o het:n:i:r: -- "$@")
+
+if [[ $? -ne 0 ]]; then
+    usage "could not parse options"
+fi
+
+eval set -- "$OPTS"
+
+#default will retry 2x
+retries=1
+timeout=2
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -n)
+            retries="$2"
+            shift;
+            shift;
+            ;;
+        -t)
+            timeout="$2"
+            shift;
+            shift;
+            ;;
+	-h)
+	    usage;
+	    exit 1;
+	    ;;
+	-e)
+	    EXPORT_ENV="$1"
+	    shift;
+	    ;;
+	    
+	-i)
+	    EC2_INSTANCE_ID="$2"
+	    shift;
+	    shift;
+	    ;;
+	-r)
+	    AWS_REGION="$2"
+	    shift;
+	    shift;
+	    ;;
+	*)
+	    break;
+	    ;;
+    esac
+done
+
+shift;
+
+EC2_TAG_NAME="$1"
+
+test -z "$EC2_TAG_NAME" && usage "no tag name"
+test -z "$EC2_INSTANCE_ID" && usage "no instance id available"
+
+EC2_TAG_VALUE="None"
+
+while true; do
+
+    # I prefer jq, but less dependencies
+    jmes_query='Tags[?Key == `'$EC2_TAG_NAME'`] | [?ResourceId == `'$EC2_INSTANCE_ID'`].Value | [0]'
+    
+    EC2_TAG_VALUE=$(aws ec2 describe-tags --output text \
+			--filter Name="resource-type",Values=instance \
+			--query="$jmes_query" \
+			--region=$AWS_REGION
+		 )
+    
+    [ "$EC2_TAG_VALUE" != "None" ] && break;
+    
+    retries=$[$retries-1]
+    
+    [ "$retries" -eq "0" ] && break;
+    
+    # exponential backoff
+    sleep $timeout
+    timeout=$[$timeout+$timeout]
+done
+
+if [ "$EC2_TAG_VALUE" = "None" ]; then
+    echo ""
+    exit 1;
+else
+    if [ -n "$EXPORT_ENV" ]; then
+        echo "export $(echo $EC2_TAG_NAME |tr [:lower:] [:upper:])=\"$EC2_TAG_VALUE\""
+    else
+        echo "$EC2_TAG_VALUE"
+    fi
+    
+    exit 0;
+fi
